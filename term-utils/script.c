@@ -63,6 +63,7 @@
 #include <sys/signalfd.h>
 #include <assert.h>
 #include <inttypes.h>
+#include <ctype.h>
 
 #include "closestream.h"
 #include "nls.h"
@@ -96,6 +97,12 @@ UL_DEBUG_DEFINE_MASKNAMES(script) = UL_DEBUG_EMPTY_MASKNAMES;
 
 #define DEFAULT_TYPESCRIPT_FILENAME "typescript"
 
+char sizes[] = {'K','M','G'};
+float total_write_size = 0;
+float parse_bytes_for_size_limit(char * str);
+char * humanize(float  number);
+
+
 struct script_control {
 	char *shell;		/* shell to be executed */
 	char *command;		/* command to be executed */
@@ -127,6 +134,7 @@ struct script_control {
 	sigset_t sigset;	/* catch SIGCHLD and SIGWINCH with signalfd() */
 	sigset_t sigorg;	/* original signal mask */
 	int sigfd;		/* file descriptor for signalfd() */
+	float size_limit; /* output file size limit */
 };
 
 static void script_init_debug(void)
@@ -162,15 +170,16 @@ static void __attribute__((__noreturn__)) usage(FILE *out)
 	fputs(_("Make a typescript of a terminal session.\n"), out);
 
 	fputs(USAGE_OPTIONS, out);
-	fputs(_(" -a, --append            append the output\n"
-		" -c, --command <command> run command rather than interactive shell\n"
-		" -e, --return            return exit code of the child process\n"
-		" -f, --flush             run flush after each write\n"
-		"     --force             use output file even when it is a link\n"
-		" -q, --quiet             be quiet\n"
-		" -t, --timing[=<file>]   output timing data to stderr (or to FILE)\n"
-		" -V, --version           output version information and exit\n"
-		" -h, --help              display this help and exit\n\n"), out);
+	fputs(_(" -a, --append              append the output\n"
+		" -c, --command <command>   run command rather than interactive shell\n"
+		" -e, --return              return exit code of the child process\n"
+		" -f, --flush               run flush after each write\n"
+		"     --force               use output file even when it is a link\n"
+		" -q, --quiet               be quiet\n"
+		" -t, --timing[=<file>]     output timing data to stderr (or to FILE)\n"
+		" -l, --size-limit <size>   limit for the output file size\n"
+		" -V, --version             output version information and exit\n"
+		" -h, --help                display this help and exit\n\n"), out);
 
 	fprintf(out, USAGE_MAN_TAIL("script(1)"));
 	exit(out == stderr ? EXIT_FAILURE : EXIT_SUCCESS);
@@ -356,7 +365,18 @@ static void handle_io(struct script_control *ctl, int fd, int *eof)
 	/* from command (master) to stdout */
 	} else if (fd == ctl->master) {
 		DBG(IO, ul_debug(" master --> stdout %zd bytes", bytes));
+
 		write_output(ctl, buf, bytes);
+
+		if ( ctl->size_limit < 0 )
+			return;
+
+		total_write_size += bytes;
+		if ( total_write_size > ctl->size_limit ) {
+			printf(_("\n\r\nTotal write size %s - exceeded %s write limit -> exit\n"), humanize(total_write_size), humanize(ctl->size_limit));
+			fail(ctl);
+		}
+
 	}
 }
 
@@ -666,6 +686,7 @@ int main(int argc, char **argv)
 		.poll_timeout = -1,
 		0
 	};
+	ctl.size_limit = -1;
 	int ch;
 
 	enum { FORCE_OPTION = CHAR_MAX + 1 };
@@ -678,6 +699,7 @@ int main(int argc, char **argv)
 		{"force", no_argument, NULL, FORCE_OPTION,},
 		{"quiet", no_argument, NULL, 'q'},
 		{"timing", optional_argument, NULL, 't'},
+		{"size-limit", required_argument, NULL, 'l'},
 		{"version", no_argument, NULL, 'V'},
 		{"help", no_argument, NULL, 'h'},
 		{NULL, 0, NULL, 0}
@@ -698,7 +720,7 @@ int main(int argc, char **argv)
 
 	script_init_debug();
 
-	while ((ch = getopt_long(argc, argv, "ac:efqt::Vh", longopts, NULL)) != -1)
+	while ((ch = getopt_long(argc, argv, "ac:efqtl:Vh", longopts, NULL)) != -1)
 		switch (ch) {
 		case 'a':
 			ctl.append = 1;
@@ -722,6 +744,10 @@ int main(int argc, char **argv)
 			if (optarg)
 				ctl.tname = optarg;
 			ctl.timing = 1;
+			break;
+		case 'l':
+			//sscanf(optarg, "%f", &ctl.size_limit);
+			ctl.size_limit = parse_bytes_for_size_limit(optarg);
 			break;
 		case 'V':
 			printf(UTIL_LINUX_VERSION);
@@ -791,3 +817,48 @@ int main(int argc, char **argv)
 	/* should not happen, all used functions are non-return */
 	return EXIT_FAILURE;
 }
+
+float parse_bytes_for_size_limit(char * str) {
+	float size = -2;
+	char postfix = '\0';
+	sscanf(str, "%f%c", &size, &postfix);
+	if (size < 0)
+		errx(EXIT_FAILURE,  "Bad size limit!");
+
+	switch(toupper(postfix)){
+		case 'B':
+			break;
+		case 'K':
+			size = size * 1024;
+			break;
+		case 'M':
+			size = size * 1024 * 1024;
+			break;
+		case 'G':
+			size = size * 1024 * 1024 * 1024;
+			break;
+		case '\0':
+			break;
+		default:
+			errx(EXIT_FAILURE,  "Bad postfix in size limit! We support only B,K,M,G");
+			size = -2;
+	}
+	return size;
+}
+
+char * humanize(float  number) {
+	char * result= (char *) malloc(sizeof(char) * 200);
+	char postfix = '\0';
+	int i;
+	for (i = 0; i < 3; i++ ) {
+		if (number < 1024 )
+			break;
+
+		number = number/1024;
+		postfix = sizes[i];
+	}
+	sprintf(result,"%.2f%c", number, postfix);
+	
+	return result;
+}
+
